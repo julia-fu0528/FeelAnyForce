@@ -212,11 +212,17 @@ class RGB2NormNet(nn.Module):
 
 
 class Reconstruction3D:
+    zero_frames = 50
+
     def __init__(self, dev):
         self.cpuorgpu = "cpu"
         self.dm_zero_counter = 0
         self.dm_zero = np.zeros((dev.imgw, dev.imgh))
         pass
+
+    def reset_zero(self):
+        self.dm_zero_counter = 0
+        self.dm_zero.fill(0.)
 
     def load_nn(self, net_path, cpuorgpu):
 
@@ -329,12 +335,12 @@ class Reconstruction3D:
         # cv2.imshow('dm',dm)
 
         ''' remove initial zero depth '''
-        if self.dm_zero_counter < 50:
+        if self.dm_zero_counter < self.zero_frames:
             self.dm_zero += dm
             print('zeroing depth. do not touch the gel!')
-            if self.dm_zero_counter == 49:
-                self.dm_zero /= self.dm_zero_counter
-        if self.dm_zero_counter == 50:
+            if self.dm_zero_counter == self.zero_frames - 1:
+                self.dm_zero /= self.zero_frames
+        if self.dm_zero_counter == self.zero_frames:
             print('Ok to touch me now!')
         self.dm_zero_counter += 1
         dm = dm - self.dm_zero

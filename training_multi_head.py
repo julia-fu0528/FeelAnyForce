@@ -1,4 +1,3 @@
-import argparse
 import json
 import logging
 import numpy as np
@@ -28,6 +27,25 @@ dir_name = Path(os.path.abspath(os.path.dirname(__file__)))
 os.environ["WANDB_SILENT"] = "true"
 
 
+def load_calibration_checkpoint(args):
+    """Restore model/preprocessing settings while retaining this run's CLI options."""
+    checkpoint_path = Path(args.checkpoint)
+    if args.checkpoint == 'best_val.pth.tar':
+        checkpoint_path = Path(args.ckpt_dir) / checkpoint_path
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f'Calibration checkpoint not found: {checkpoint_path}. '
+            'Pass --checkpoint ckpt/checkpoint_v1.pth.tar (input weights); '
+            '--ckpt_dir is the output directory.')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    config = checkpoint.get('config', {})
+    for key in ('tactile_repo', 'tactile_model', 'n_last_blocks', 'avgpool_patchtokens',
+                'forward', 'num_labels', 'crop_size', 'bias', 'tactile_mode', 'input_modality'):
+        if key in config:
+            setattr(args, key, config[key])
+    return checkpoint
+
+
 def train_regressor(args):
     """
     Main function for training the regressor and decoder.
@@ -38,31 +56,11 @@ def train_regressor(args):
 
     cudnn.benchmark = True
 
-    # Load the model
+    # Use the pretrained model's normalization, without replacing dataset/output options.
+    normalization_labels = args.labels_train
     if args.tactile_backbone_training == 'calibration':
-        ckpt = torch.load(os.path.join(args.ckpt_dir, "best_val.pth.tar"))
-        if "config" in ckpt.keys():
-            # Save new training values
-            ckpt["config"]["data_basedir"] = args.data_basedir
-            config = argparse.Namespace(**ckpt["config"])
-            labels_train = args.labels_train
-            tactile_backbone_train = 'calibration'
-            labels_val = args.labels_val
-            training_name = args.training_name + '_calibrated'
-            layers_calibration = args.layers_calibration
-            lr_calibration = args.lr_calibration
-            epochs = args.epochs
-            scheduler = args.scheduler
-
-            # Update the config
-            args.__dict__.update(vars(config))
-            args.labels_val = labels_val
-            args.training_name = training_name
-            args.tactile_backbone_training = tactile_backbone_train
-            args.layers_calibration = layers_calibration
-            args.epochs = epochs
-            args.lr_calibration = lr_calibration
-            args.scheduler = scheduler
+        ckpt = load_calibration_checkpoint(args)
+        normalization_labels = ckpt.get('config', {}).get('labels_train', args.labels_train)
 
     model = ComposedModel(args)
     formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -77,9 +75,9 @@ def train_regressor(args):
     with open(args.dataset_stats) as convert_file:
         dataset_mean_std = json.load(convert_file)
 
-    if args.labels_train in dataset_mean_std and args.tactile_mode in dataset_mean_std[args.labels_train]:
-        mean_rgb, std_rgb = dataset_mean_std[args.labels_train][args.tactile_mode]
-        mean_depth, std_depth = dataset_mean_std[args.labels_train]['depth']
+    if normalization_labels in dataset_mean_std and args.tactile_mode in dataset_mean_std[normalization_labels]:
+        mean_rgb, std_rgb = dataset_mean_std[normalization_labels][args.tactile_mode]
+        mean_depth, std_depth = dataset_mean_std[normalization_labels]['depth']
     else:
         logger.info('Calculating normalization parameters..')
         mean_rgb, std_rgb, mean_depth, std_depth = utils.compute_mean_std(
@@ -94,7 +92,11 @@ def train_regressor(args):
     logger.info(
         f"Dataset with {mean_rgb} mean and {std_rgb} std for rgb and {mean_depth} mean and {std_depth} std for depth.")
     if args.tactile_backbone_training == 'calibration':
-        args.labels_train = labels_train
+        # Inference reads statistics using the training CSV saved in the new checkpoint.
+        dataset_mean_std[args.labels_train] = {
+            args.tactile_mode: [mean_rgb, std_rgb], 'depth': [mean_depth, std_depth]}
+        with open(args.dataset_stats, 'w') as json_file:
+            json.dump(dataset_mean_std, json_file, indent=2)
 
     transform_rgb = pth_transforms.Compose([
         pth_transforms.Pad([0, 40, 0, 40]),
@@ -135,6 +137,7 @@ def train_regressor(args):
         pin_memory=True,
     )
 
+    test_loader_seen = None
     if os.path.isfile(os.path.join(args.data_basedir, args.labels_test_seen)):
         dataset_test_seen = TacForceDataset(args=args,
                                             split="test_seen",
@@ -214,7 +217,6 @@ def train_regressor(args):
             "best_val_loss": best_val_loss,
             "config": vars(args)}
 
-        torch.save(save_dict, os.path.join(exp_dir, "last.pth.tar"))
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
 
             val_stats = validate_network(val_loader, model, args)
@@ -225,10 +227,13 @@ def train_regressor(args):
             if val_stats['loss'] < best_val_loss:
                 logger.info(f"New optimum find at epoch {epoch}")
                 best_val_loss = val_stats["loss"]
+                save_dict["best_val_loss"] = best_val_loss
                 torch.save(save_dict, os.path.join(exp_dir, "best_val.pth.tar"))
-                test_stats = validate_network(test_loader_seen, model, args)
-                log_stats = {**{k: v for k, v in log_stats.items()},
-                             **{f'test_seen_{k}': v for k, v in test_stats.items()}}
+                if test_loader_seen is not None:
+                    test_stats = validate_network(test_loader_seen, model, args)
+                    log_stats.update({f'test_seen_{k}': v for k, v in test_stats.items()})
+
+        torch.save(save_dict, os.path.join(exp_dir, "last.pth.tar"))
 
         if args.wandb:
             wandb.log(log_stats, step=epoch)
@@ -292,7 +297,7 @@ def train(model, optimizer, loader, epoch, args):
 
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
-    logger.info("Averaged stats:", metric_logger)
+    logger.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -342,7 +347,7 @@ def validate_network(val_loader, model, args):
 
         metric_logger.update(loss=loss.item())
 
-    logger.info("Averaged stats:", metric_logger)
+    logger.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 

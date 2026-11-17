@@ -18,16 +18,35 @@ def get_camera_id(camera_name):
     if os.name == 'nt':
         cam_num = find_cameras_windows(camera_name)
     else:
-        for file in os.listdir("/sys/class/video4linux"):
+        candidates = []
+        device_dir = "/sys/class/video4linux"
+        for file in sorted(os.listdir(device_dir) if os.path.isdir(device_dir) else []):
             real_file = os.path.realpath("/sys/class/video4linux/" + file + "/name")
             with open(real_file, "rt") as name_file:
                 name = name_file.read().rstrip()
             if camera_name in name:
-                cam_num = int(re.search("\d+$", file).group(0))
+                candidates.append(int(re.search(r"\d+$", file).group(0)))
                 found = "FOUND!"
             else:
                 found = "      "
             print("{} {} -> {}".format(found, file, name))
+
+        # UVC cameras expose video and metadata nodes with identical names.
+        # Select a node that actually delivers an image, not the last name match.
+        for candidate in sorted(candidates):
+            capture = cv2.VideoCapture(candidate, cv2.CAP_V4L2)
+            try:
+                if capture.isOpened():
+                    for _ in range(3):
+                        ok, frame = capture.read()
+                        if ok and frame is not None and frame.size:
+                            return candidate
+            finally:
+                capture.release()
+        raise RuntimeError(
+            f'No readable video stream for {camera_name!r}; tried {candidates}. '
+            'Check the USB connection, camera permissions, and other camera applications.'
+        )
 
     return cam_num
 
@@ -80,7 +99,9 @@ class Camera:
         # The camera in Mini is a USB camera and uses open cv to get the video data from the streamed video
         self.cam = cv2.VideoCapture(self.dev_id)
         if self.cam is None or not self.cam.isOpened():
-            print('Warning: unable to open video source: ', self.dev_id)
+            if self.cam is not None:
+                self.cam.release()
+            raise RuntimeError(f'Unable to open {self.name} video source: {self.dev_id}')
         self.imgw = 240
         self.imgh = 320
 
